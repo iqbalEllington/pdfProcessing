@@ -27,6 +27,7 @@ app = FastAPI(
     title="PDF Image Overlay API",
     description="Place a PNG onto one, several, or all pages of a PDF at given coordinates/size.",
     version="1.2.0",
+    root_path="/python"
 )
 
 MAX_FILE_SIZE_MB = 25
