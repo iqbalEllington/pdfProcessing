@@ -30,10 +30,76 @@ down, 30% wide"), tell me the page size on your end and convert to points
 before calling this API — happy to add a `unit=percent` mode instead if
 that's a better fit for your input format.
 
+## Authentication (JWT, no database)
+
+The API is now protected. Clients log in once with a username + password
+(stored as a bcrypt hash in an environment variable — no database) and get
+back a JWT they use on every subsequent request.
+
+- `GET /health` — public, no auth needed.
+- `POST /token` — public, this is the login endpoint.
+- `POST /place-image` — **protected**, requires `Authorization: Bearer <token>`.
+
+### 1. Generate a password hash for each client
+
+```bash
+python3 generate_password_hash.py
+```
+
+It'll ask for a username and password and print a JSON snippet like:
+```json
+{"client1": "$2b$12$Ja8Qu1h9m5kpEmeOxJaT9ekDC.bjbucH7CYWc6Jb.viRibwoJe7I2"}
+```
+
+Run it again for each additional client and merge the keys into one object.
+
+### 2. Set environment variables
+
+Copy `.env.example` to `.env` and fill in:
+
+```bash
+JWT_SECRET_KEY=<generate with: python3 -c "import secrets; print(secrets.token_hex(32))">
+JWT_EXPIRE_MINUTES=120
+USERS_JSON={"client1": "$2b$12$Ja8Qu1h9m5kpEmeOxJaT9ekDC.bjbucH7CYWc6Jb.viRibwoJe7I2", "client2": "$2b$12$..."}
+```
+
+The app refuses to start if `JWT_SECRET_KEY` or `USERS_JSON` are missing, so
+you can't accidentally deploy it unprotected.
+
+### 3. Give each client their username + password
+
+That's what they use to log in. They should **not** be given the bcrypt hash
+— just the plaintext username/password you chose in step 1.
+
+### 4. Client usage: log in, then call the API
+
+```bash
+# Step 1: log in to get a token (repeat this whenever the token expires)
+curl -X POST https://api.yourdomain.com/token \
+  -d "username=client1&password=their-actual-password"
+# -> {"access_token": "eyJ...", "token_type": "bearer"}
+
+# Step 2: use the token on the real endpoint
+curl -o output.pdf \
+  -H "Authorization: Bearer eyJ..." \
+  -F "pdf=@input.pdf" -F "png=@logo.png" \
+  -F "x=50" -F "y=50" -F "width=150" -F "pages=all" \
+  https://api.yourdomain.com/place-image
+```
+
+Tokens expire after `JWT_EXPIRE_MINUTES` (default 120 minutes) — clients just
+call `/token` again to get a new one. There's no logout/revoke endpoint since
+there's no database to track sessions in; to fully revoke access for one
+client, remove them from `USERS_JSON` and restart the service (their existing
+un-expired tokens will then also be rejected, since the code checks the
+username still exists in `USERS_JSON` on every request).
+
 ## Run it locally
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env   # then edit .env with your real JWT_SECRET_KEY and USERS_JSON
+python3 generate_password_hash.py   # do this first to create your first user
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -69,7 +135,20 @@ curl -o output.pdf \
 
 ## API reference
 
-### `POST /place-image`
+### `POST /token`
+
+Login. Send as `application/x-www-form-urlencoded`:
+
+| Field      | Description         |
+|------------|----------------------|
+| `username` | Client's username    |
+| `password` | Client's password    |
+
+Response: `{"access_token": "...", "token_type": "bearer"}`, or 401 if wrong.
+
+### `POST /place-image` *(requires auth)*
+
+Header required: `Authorization: Bearer <token from /token>`
 
 Multipart form fields:
 
@@ -150,6 +229,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=/opt/pdf-overlay-api
+EnvironmentFile=/opt/pdf-overlay-api/.env
 ExecStart=/opt/pdf-overlay-api/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 Restart=always
 User=www-data
@@ -157,6 +237,10 @@ User=www-data
 [Install]
 WantedBy=multi-user.target
 ```
+
+`EnvironmentFile` loads `JWT_SECRET_KEY`, `USERS_JSON`, etc. from your `.env`
+file at startup. Make sure `/opt/pdf-overlay-api/.env` exists and is only
+readable by `www-data`/root (`chmod 600 .env`) since it contains secrets.
 
 ```bash
 sudo systemctl enable --now pdf-overlay-api

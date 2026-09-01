@@ -16,14 +16,17 @@ import io
 from typing import List, Optional
 
 import pymupdf as fitz  # PyMuPDF (new import name; 'fitz' alias kept for brevity below)
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from fastapi.security import OAuth2PasswordRequestForm
 from PIL import Image
+
+from auth import authenticate_user, create_access_token, get_current_user
 
 app = FastAPI(
     title="PDF Image Overlay API",
     description="Place a PNG onto one, several, or all pages of a PDF at given coordinates/size.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 MAX_FILE_SIZE_MB = 25
@@ -32,6 +35,29 @@ MAX_FILE_SIZE_MB = 25
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Login endpoint. Send username + password as form fields (standard OAuth2
+    password flow), get back a JWT to use on protected endpoints.
+
+    Example:
+        curl -X POST http://localhost:8000/token \\
+          -d "username=client1&password=their-password"
+
+    Then use the returned token:
+        curl -H "Authorization: Bearer <access_token>" ...
+    """
+    if not authenticate_user(form_data.username, form_data.password):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(form_data.username)
+    return {"access_token": token, "token_type": "bearer"}
 
 
 def parse_pages(pages_str: str, total_pages: int) -> List[int]:
@@ -128,6 +154,7 @@ async def place_image(
         "matches most design tools) or 'bottom-left' (y grows upward, matches "
         "PDF/PostScript convention).",
     ),
+    current_user: str = Depends(get_current_user),
 ):
     # --- Validate simple inputs -------------------------------------------
     if origin not in ("top-left", "bottom-left"):
