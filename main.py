@@ -27,7 +27,6 @@ app = FastAPI(
     title="PDF Image Overlay API",
     description="Place a PNG onto one, several, or all pages of a PDF at given coordinates/size.",
     version="1.2.0",
-    root_path="/python"
 )
 
 MAX_FILE_SIZE_MB = 25
@@ -130,12 +129,81 @@ def parse_optional_float(value: Optional[str], field_name: str) -> Optional[floa
         raise HTTPException(400, f"'{field_name}' must be a number, 'auto', or omitted")
 
 
+def find_text_matches(pg, text: str, case_sensitive: bool):
+    """
+    Find all occurrences of `text` on a page, returning a list of fitz.Rect.
+    PyMuPDF's search_for() is case-insensitive by default; when
+    case_sensitive=True we additionally verify the extracted text at each
+    match actually matches case-for-case (guards against e.g. matching
+    "Signature" when the PDF really has "SIGNATURE" and the caller cares).
+    """
+    matches = pg.search_for(text)
+    if not case_sensitive:
+        return matches
+
+    exact = []
+    for rect in matches:
+        extracted = pg.get_textbox(rect).strip()
+        if text.strip() in extracted or extracted in text.strip():
+            exact.append(rect)
+    return exact
+
+
+def compute_anchor_rect(
+    text_rect: "fitz.Rect",
+    position: str,
+    width: float,
+    height: float,
+    gap: float,
+    dx: float,
+    dy: float,
+) -> "fitz.Rect":
+    """
+    Given the bounding box of an anchor text match, compute where the image
+    rect should go for a given relative position. dx/dy are extra manual
+    offsets applied after the automatic positioning (e.g. to nudge it a bit).
+    """
+    if position == "above":
+        x0 = text_rect.x0
+        y0 = text_rect.y0 - gap - height
+    elif position == "below":
+        x0 = text_rect.x0
+        y0 = text_rect.y1 + gap
+    elif position == "left":
+        x0 = text_rect.x0 - gap - width
+        y0 = text_rect.y0
+    elif position == "right":
+        x0 = text_rect.x1 + gap
+        y0 = text_rect.y0
+    elif position == "on":
+        x0 = text_rect.x0
+        y0 = text_rect.y0
+    else:
+        raise HTTPException(
+            400, "anchor_position must be one of: above, below, left, right, on"
+        )
+
+    x0 += dx
+    y0 += dy
+    return fitz.Rect(x0, y0, x0 + width, y0 + height)
+
+
 @app.post("/place-image")
 async def place_image(
     pdf: UploadFile = File(..., description="The base PDF file"),
     png: UploadFile = File(..., description="The PNG image to place"),
-    x: float = Form(..., description="X coordinate (points, 1/72 inch) of the image's top-left corner"),
-    y: float = Form(..., description="Y coordinate (points) of the image's top-left corner"),
+    x: Optional[str] = Form(
+        None,
+        description="X coordinate (points) of the image's top-left corner. "
+        "Required unless anchor_text is set, in which case it's an optional "
+        "horizontal nudge (points, default 0) applied after auto-positioning.",
+    ),
+    y: Optional[str] = Form(
+        None,
+        description="Y coordinate (points) of the image's top-left corner. "
+        "Required unless anchor_text is set, in which case it's an optional "
+        "vertical nudge (points, default 0) applied after auto-positioning.",
+    ),
     width: float = Form(..., description="Width of the placed image, in points"),
     height: Optional[str] = Form(
         None,
@@ -151,9 +219,37 @@ async def place_image(
     ),
     origin: str = Form(
         "top-left",
-        description="Coordinate origin: 'top-left' (default, y grows downward, "
-        "matches most design tools) or 'bottom-left' (y grows upward, matches "
-        "PDF/PostScript convention).",
+        description="Coordinate origin for absolute x/y placement (ignored "
+        "when anchor_text is set): 'top-left' (default, y grows downward) or "
+        "'bottom-left' (y grows upward, PDF/PostScript convention).",
+    ),
+    anchor_text: Optional[str] = Form(
+        None,
+        description="Exact text to find on the page(s), e.g. 'Signature and "
+        "Stamp of Agent'. When set, the image is placed automatically "
+        "relative to this text instead of using absolute x/y coordinates.",
+    ),
+    anchor_position: str = Form(
+        "above",
+        description="Where to place the image relative to anchor_text: "
+        "'above', 'below', 'left', 'right', or 'on' (directly over the "
+        "text's own bounding box). Only used when anchor_text is set.",
+    ),
+    anchor_gap: float = Form(
+        6.0,
+        description="Gap in points between the anchor text and the image "
+        "(ignored when anchor_position='on').",
+    ),
+    anchor_occurrence: str = Form(
+        "first",
+        description="'first' to use only the first (topmost) match of "
+        "anchor_text on each page, or 'all' to place the image at every "
+        "occurrence found on that page.",
+    ),
+    anchor_case_sensitive: bool = Form(
+        False,
+        description="If true, require anchor_text to match case-for-case. "
+        "Default false (case-insensitive), which is usually what you want.",
     ),
     current_user: str = Depends(get_current_user),
 ):
@@ -162,6 +258,25 @@ async def place_image(
         raise HTTPException(400, "origin must be 'top-left' or 'bottom-left'")
     if width <= 0:
         raise HTTPException(400, "width must be positive")
+    if anchor_occurrence not in ("first", "all"):
+        raise HTTPException(400, "anchor_occurrence must be 'first' or 'all'")
+    if anchor_position not in ("above", "below", "left", "right", "on"):
+        raise HTTPException(
+            400, "anchor_position must be one of: above, below, left, right, on"
+        )
+
+    use_anchor = bool(anchor_text and anchor_text.strip())
+
+    x_val = parse_optional_float(x, "x")
+    y_val = parse_optional_float(y, "y")
+    if use_anchor:
+        x_val = x_val if x_val is not None else 0.0  # optional nudge
+        y_val = y_val if y_val is not None else 0.0
+    else:
+        if x_val is None or y_val is None:
+            raise HTTPException(
+                400, "x and y are required when anchor_text is not provided"
+            )
 
     height_val = parse_optional_float(height, "height")
     if height_val is not None and height_val <= 0:
@@ -200,18 +315,47 @@ async def place_image(
 
     target_pages = parse_pages(pages, len(doc))  # raises 400 on bad input
 
-    for page_num in target_pages:
+    # --- Compute every placement first (fail fast, nothing partially applied) --
+    placements = []  # list of (page_num, fitz.Rect)
+
+    if use_anchor:
+        pages_missing_text = []
+        for page_num in target_pages:
+            pg = doc[page_num - 1]
+            matches = find_text_matches(pg, anchor_text, anchor_case_sensitive)
+            if not matches:
+                pages_missing_text.append(page_num)
+                continue
+            chosen = matches if anchor_occurrence == "all" else matches[:1]
+            for text_rect in chosen:
+                rect = compute_anchor_rect(
+                    text_rect, anchor_position, width, height_val, anchor_gap, x_val, y_val
+                )
+                placements.append((page_num, rect))
+
+        if pages_missing_text:
+            doc.close()
+            raise HTTPException(
+                400,
+                f"anchor_text '{anchor_text}' was not found on page(s) "
+                f"{pages_missing_text}",
+            )
+    else:
+        for page_num in target_pages:
+            pg = doc[page_num - 1]
+            page_rect = pg.rect  # fitz page rect: origin top-left, y grows downward
+
+            place_x = x_val
+            place_y = y_val
+            if origin == "bottom-left":
+                place_y = page_rect.height - y_val - height_val
+
+            rect = fitz.Rect(place_x, place_y, place_x + width, place_y + height_val)
+            placements.append((page_num, rect))
+
+    # --- Apply every placement ----------------------------------------------
+    for page_num, rect in placements:
         pg = doc[page_num - 1]
-        page_rect = pg.rect  # fitz page rect: origin top-left, y grows downward
-
-        place_x = x
-        place_y = y
-        if origin == "bottom-left":
-            # convert a bottom-left-anchored y into fitz's top-left system
-            place_y = page_rect.height - y - height_val
-
-        rect = fitz.Rect(place_x, place_y, place_x + width, place_y + height_val)
-
         try:
             pg.insert_image(rect, stream=png_bytes)
         except Exception as e:

@@ -156,12 +156,59 @@ Multipart form fields:
 |----------|--------|----------|---------------------------------------------------------------------------|
 | `pdf`    | file   | yes      | The base PDF                                                             |
 | `png`    | file   | yes      | The PNG to place                                                         |
-| `x`      | float  | yes      | X position of the image's top-left corner (points)                      |
-| `y`      | float  | yes      | Y position of the image's top-left corner (points)                      |
+| `x`      | float  | conditionally* | X position (points). *Required unless `anchor_text` is set, where it's an optional horizontal nudge (default 0) |
+| `y`      | float  | conditionally* | Y position (points). *Required unless `anchor_text` is set, where it's an optional vertical nudge (default 0)   |
 | `width`  | float  | yes      | Width of the placed image (points)                                      |
 | `height` | float  | no       | Height (points). **Omit it, leave it blank, or send `auto`** to auto-preserve the PNG's aspect ratio (no distortion) |
 | `pages`  | string | no       | Which page(s) to stamp. Default `1`. See formats below                  |
-| `origin` | string | no       | `top-left` (default) or `bottom-left`                                   |
+| `origin` | string | no       | `top-left` (default) or `bottom-left`. **Ignored when `anchor_text` is set.** |
+| `anchor_text` | string | no  | Exact text to find on the page and position relative to (see below)     |
+| `anchor_position` | string | no | `above` (default), `below`, `left`, `right`, or `on` (directly over the text) |
+| `anchor_gap` | float | no    | Gap in points between the text and the image (default `6`)              |
+| `anchor_occurrence` | string | no | `first` (default, topmost match only) or `all` (every match on that page) |
+| `anchor_case_sensitive` | bool | no | `false` (default) or `true` — whether `anchor_text` must match case-for-case |
+
+### Text-anchored placement
+
+Instead of giving absolute coordinates, you can tell the API to find a
+specific piece of text on the page (e.g. `"Signature and Stamp of Agent"`)
+and place the image relative to it:
+
+```bash
+curl -o output.pdf \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "pdf=@contract.pdf" -F "png=@signature.png" \
+  -F "width=150" \
+  -F "anchor_text=Signature and Stamp of Agent" \
+  -F "anchor_position=above" \
+  -F "pages=all" \
+  http://localhost:8000/place-image
+```
+
+That places a 150pt-wide signature image, height auto-scaled, just above
+every occurrence of that phrase on every page it appears on.
+
+**`anchor_position` options** (relative to the found text's bounding box):
+- `above` — image sits just above the text, left-aligned to it (good for "sign above this line")
+- `below` — image sits just below the text
+- `left` — image sits just to the left of the text
+- `right` — image sits just to the right of the text
+- `on` — image is placed directly over the text's own position (e.g. to stamp exactly where a placeholder word is)
+
+**Nudging the position:** `x` and `y` become optional fine-tuning offsets
+in anchor mode — e.g. `x=10&y=-5` shifts the auto-computed position 10pt
+right and 5pt up from wherever it would otherwise land.
+
+**Multiple matches:** if the text appears more than once on a page,
+`anchor_occurrence=first` (default) only uses the top-most match;
+`anchor_occurrence=all` stamps the image at every occurrence on that page.
+
+**If the text isn't found:** the whole request fails with a 400 listing
+exactly which page(s) didn't contain it — nothing is partially modified.
+This also means with `pages=all`, every target page must contain the text;
+if you only want pages that have the signature line to get stamped, you'll
+need to pick those pages explicitly (e.g. `pages=1,3,5`) rather than `all`.
+
 
 **`pages` formats:**
 
